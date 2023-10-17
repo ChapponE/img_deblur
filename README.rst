@@ -1,5 +1,5 @@
 Deblur and Denoise Images using Unfolded Forward Backward
-------------
+============
 Introduction
 ------------
 This project aims to deblur and denoise images, with a focus on the MNIST dataset. The methodology is based on the "Unfolded Forward Backward" approach, developed as part of the master's thesis project at ENS Lyon.
