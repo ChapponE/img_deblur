@@ -1,0 +1,7 @@
+# Folders
+venv/*
+data/datasets_dinv/sb=0.5_s=7_sn=0.25/*
+
+# Files
+*.h5
+*.tar

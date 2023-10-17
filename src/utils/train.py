@@ -1,0 +1,373 @@
+from deepinv.utils import (
+    # save_model,
+    AverageMeter,
+    ProgressMeter,
+    get_timestamp,
+    cal_psnr,
+)
+from deepinv.utils import plot, torch2cpu, wandb_imgs
+import numpy as np
+from tqdm import tqdm
+import torch
+import wandb
+import matplotlib.pyplot as plt
+import matplotlib
+from pathlib import Path
+import os
+
+def find_available_folder(save_path):
+    folder_count = 0
+    while True:
+        folder_name = f"train_{folder_count}"
+        folder_path = os.path.join(save_path, folder_name)
+        if not os.path.exists(folder_path):
+            return folder_name
+        folder_count += 1
+
+def train(
+    model,
+    train_dataloader,
+    epochs,
+    losses,
+    eval_dataloader=None,
+    physics=None,
+    optimizer=None,
+    scheduler=None,
+    device="cpu",
+    ckp_interval=1,
+    eval_interval=1,
+    log_interval=1,
+    save_path=".",
+    verbose=False,
+    unsupervised=False,
+    plot_images=False,
+    save_images=False,
+    plot_metrics=False,
+    wandb_vis=False,
+    n_plot_max_wandb=8,
+):
+    r"""
+    Trains a reconstruction network.
+
+
+    :param torch.nn.Module, deepinv.models.ArtifactRemoval model: Reconstruction network, which can be PnP, unrolled, artifact removal
+        or any other custom reconstruction network.
+    :param torch.utils.data.DataLoader train_dataloader: Train dataloader.
+    :param int epochs: Number of training epochs.
+    :param torch.nn.Module, list of torch.nn.Module losses: Loss or list of losses used for training the model.
+    :param torch.utils.data.DataLoader eval_dataloader: Evaluation dataloader.
+    :param deepinv.physics.Physics physics: Forward operator containing the physics of the inverse problem.
+    :param torch.nn.optim optimizer: Torch optimizer for training the network.
+    :param torch.nn.optim scheduler: Torch scheduler for changing the learning rate across iterations.
+    :param torch.device device: gpu or cpu.
+    :param int ckp_interval: The model is saved every ``ckp_interval`` epochs.
+    :param int eval_interval: Number of epochs between each evaluation of the model on the evaluation set.
+    :param str save_path: Directory in which to save the trained model.
+    :param bool verbose: Output training progress information in the console.
+    :param bool unsupervised: Train an unsupervised network, i.e., uses only measurement vectors y for training.
+    :param bool plot_images: Plots reconstructions every ``ckp_interval`` epochs.
+    :param bool wandb_vis: Use Weights & Biases visualization, see https://wandb.ai/ for more details.
+    """
+    save_path = Path(save_path)
+
+    if not isinstance(losses, list) or isinstance(losses, tuple):
+        losses = [losses]
+
+    loss_meter = AverageMeter("loss", ":.2e")
+    meters = [loss_meter]
+    eval_psnr_net = []
+
+    losses_verbose = [AverageMeter("Loss_" + l.name, ":.2e") for l in losses]
+    train_psnr_net = AverageMeter("Train_psnr_model", ":.2f")
+    if eval_dataloader:
+        eval_psnr_net = AverageMeter("Eval_psnr_model", ":.2f")
+
+    for loss in losses_verbose:
+        meters.append(loss)
+
+    meters.append(train_psnr_net)
+    if eval_dataloader:
+        meters.append(eval_psnr_net)
+
+    progress = ProgressMeter(epochs, meters)
+
+    save_path = f"{save_path}"
+
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"The model has {params} trainable parameters")
+
+    if type(physics) is not list:
+        physics = [physics]
+
+    if type(losses) is not list:
+        losses = [losses]
+
+    if type(train_dataloader) is not list:
+        train_dataloader = [train_dataloader]
+
+    if eval_dataloader and type(eval_dataloader) is not list:
+        eval_dataloader = [eval_dataloader]
+
+    G = len(train_dataloader)
+    class_name = model.__class__.__name__
+    loss_history = []
+    psnr_history = []
+    convergence_metric_history = []
+
+    for epoch in range(epochs):
+        if eval_dataloader:
+            eval_psnr_net.reset()
+        train_psnr_net.reset()
+        iterators = [iter(loader) for loader in train_dataloader]
+        batches = len(train_dataloader[G - 1])
+        for i in range(batches):
+            G_perm = np.random.permutation(G)
+
+            for g in G_perm:
+                if unsupervised:
+                    y = next(iterators[g])
+                    x = None
+                else:
+                    x, y = next(iterators[g])
+
+                    if type(x) is list or type(x) is tuple:
+                        x = [s.to(device) for s in x]
+                    else:
+                        x = x.to(device)
+
+                y = y.to(device)
+
+                optimizer.zero_grad()
+
+                x_net = model(y, physics[g])  # Requires grad ok
+
+                loss_total = 0
+                for k, l in enumerate(losses):
+                    loss = l(x=x, x_net=x_net, y=y, physics=physics[g], model=model)
+                    loss_total += loss
+                    losses_verbose[k].update(loss.item())
+
+                loss_meter.update(loss_total.item())
+
+                if (not unsupervised) and verbose:
+                    train_psnr_net.update(cal_psnr(x_net, x))
+
+                loss_total.backward()
+                optimizer.step()
+
+        if (
+            (not unsupervised)
+            and eval_dataloader
+            and ((epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs)
+        ):
+            if hasattr(model, 'compute_convergence_metric'):
+                test_psnr, _, _, _, convergence_metric = test(
+                    model,
+                    eval_dataloader,
+                    physics,
+                    device,
+                    verbose=False,
+                    plot_images=plot_images,
+                    save_images=save_images,
+                    plot_metrics=plot_metrics,
+                    wandb_vis=wandb_vis,
+                    step=epoch,
+                    n_plot_max_wandb=n_plot_max_wandb,
+                )
+            else:
+                test_psnr, _, _, _ = test(
+                    model,
+                    eval_dataloader,
+                    physics,
+                    device,
+                    verbose=False,
+                    plot_images=plot_images,
+                    save_images=save_images,
+                    plot_metrics=plot_metrics,
+                    wandb_vis=wandb_vis,
+                    step=epoch,
+                    n_plot_max_wandb=n_plot_max_wandb,
+                )
+
+            eval_psnr_net.update(test_psnr)
+            psnr_history.append(test_psnr)
+
+            if hasattr(model, 'compute_convergence_metric'):
+                convergence_metric_history.append(convergence_metric)
+
+        if scheduler:
+            scheduler.step()
+
+        loss_history.append(loss_total.detach().cpu().numpy())
+
+        if wandb_vis:
+            wandb.log({"training loss": loss_total}, step=epoch)
+
+        if (epoch + 1) % log_interval == 0:
+            progress.display(epoch + 1)
+
+        save_model(
+            epoch, model, optimizer, ckp_interval, epochs, loss_history, psnr_history, str(save_path), criterium=convergence_metric_history,
+        )
+
+    if wandb_vis:
+        wandb.save("model.h5")
+
+    return model
+
+
+def test(
+    model,
+    test_dataloader,
+    physics,
+    device=torch.device(f"cuda:0"),
+    plot_images=False,
+    save_images=True,
+    save_folder="results",
+    plot_metrics=False,
+    verbose=True,
+    wandb_vis=False,
+    step=0,
+    n_plot_max_wandb=8,
+    **kwargs,
+):
+    r"""
+    Tests a reconstruction network.
+
+    :param torch.nn.Module, deepinv.models.ArtifactRemoval model: Reconstruction network, which can be PnP, unrolled, artifact removal
+        or any other custom reconstruction network.
+    :param torch.utils.data.DataLoader test_dataloader:
+    :param deepinv.physics.Physics physics:
+    :param torch.device device: gpu or cpu.
+    :param bool plot_images: Plot the ground-truth and estimated images.
+    :param bool save_images: Save the images.
+    :param str save_folder: Directory in which to save plotted reconstructions.
+    :param bool plot_metrics: plot the metrics to be plotted w.r.t iteration.
+    :param bool verbose: Output training progress information in the console.
+    :param bool wandb_vis: Use Weights & Biases visualization, see https://wandb.ai/ for more details.
+    """
+    save_folder = Path(save_folder)
+
+    psnr_init = []
+    psnr_net = []
+
+
+    if hasattr(model, 'compute_convergence_metric'):
+        convergent_metric = model.compute_convergence_metric()
+
+    if type(physics) is not list:
+        physics = [physics]
+
+    if type(test_dataloader) is not list:
+        test_dataloader = [test_dataloader]
+
+    G = len(test_dataloader)
+    imgs = []
+
+    show_operators = 5
+
+    for g in range(G):
+        dataloader = test_dataloader[g]
+        if verbose:
+            print(f"Processing data of operator {g+1} out of {G}")
+        for i, (x, y) in enumerate(tqdm(dataloader, disable=not verbose)):
+            if type(x) is list or type(x) is tuple:
+                x = [s.to(device) for s in x]
+            else:
+                x = x.to(device)
+
+            y = physics[g](x)
+
+            # y = y.to(device)
+
+            with torch.no_grad():
+                if plot_metrics:
+                    output_model = model(y, physics[g], x, **kwargs)
+                    if len(output_model) == 1:
+                        plot_metrics = False
+                        print(
+                            "plot_metrics is set to True but model does not returns metrics"
+                        )
+                        x1 = model(y, physics[g], **kwargs)
+                    else:
+                        x1, metrics = output_model
+                else:
+                    x1 = model(y, physics[g], **kwargs)
+
+                if hasattr(model, "custom_init") and model.custom_init:
+                    x_init = model.custom_init(y)
+                else:
+                    x_init = physics[g].A_adjoint(y)
+
+            cur_psnr_init = cal_psnr(x_init, x)
+            cur_psnr = cal_psnr(x1, x)
+
+            psnr_init.append(cur_psnr_init)
+            psnr_net.append(cur_psnr)
+
+            # if verbose:
+            #    print(
+            #        f"Test psnr: Init: {cur_psnr_init:.2f}| Model: {cur_psnr:.2f} dB. "
+            #    )
+
+            if save_images or plot_metrics:
+                save_folder_G = save_folder / ("G" + str(g))
+                save_folder_G.mkdir(parents=True, exist_ok=True)
+
+            if plot_images or save_images or wandb_vis:
+                if g < show_operators:
+                    imgs = [x_init, x1, x]
+                    name_imgs = ["Linear", "Recons.", "GT"]
+
+                    if plot_images:
+                        plot(imgs, titles=name_imgs)
+
+            if plot_metrics:
+                for metric_name, metric_val in zip(metrics.keys(), metrics.values()):
+                    if len(metric_val) > 0:
+                        batch_size, n_iter = len(metric_val), len(metric_val[0])
+
+                        if wandb_vis:
+                            wandb.log(
+                                {
+                                    f"{metric_name} batch {i}": wandb.plot.line_series(
+                                        xs=range(n_iter),
+                                        ys=metric_val,
+                                        keys=[f"image {j}" for j in range(batch_size)],
+                                        title=f"{metric_name} batch {i}",
+                                        xname="iteration",
+                                    )
+                                },
+                                step=step,
+                            )
+
+    test_psnr = np.mean(psnr_net)
+    test_std_psnr = np.std(psnr_net)
+    init_psnr = np.mean(psnr_init)
+    init_std_psnr = np.std(psnr_init)
+    if verbose:
+        print(
+            f"Test psnr: Init: {init_psnr:.2f}+-{init_std_psnr:.2f} dB | Model: {test_psnr:.2f}+-{test_std_psnr:.2f} dB. "
+        )
+    if wandb_vis:
+        wandb.log({"Test psnr": test_psnr}, step=step)
+    if hasattr(model, 'compute_convergence_metric'):
+        return test_psnr, test_std_psnr, init_psnr, init_std_psnr, convergent_metric
+    else:
+        return test_psnr, test_std_psnr, init_psnr, init_std_psnr
+
+def save_model(epoch, model, optimizer, ckp_interval, epochs, loss, psnr, save_path, criterium=None):
+    if (epoch > 0 and epoch % ckp_interval == 0) or epoch + 1 == epochs:
+        os.makedirs(save_path, exist_ok=True)
+
+        state = {
+            "epoch": epoch,
+            "state_dict": model.state_dict(),
+            "loss": loss,
+            "psnr": psnr,
+            "optimizer": optimizer.state_dict(),
+        }
+        if not criterium == []:
+            state["criterium"] = criterium
+        torch.save(state, os.path.join(save_path, "ckp_{}.pth.tar".format(epoch)))
+    pass
